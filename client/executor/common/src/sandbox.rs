@@ -22,7 +22,7 @@
 //! a compiled execution engine.
 
 use crate::error::{Result, Error};
-use std::{collections::HashMap, rc::Rc};
+use std::{collections::HashMap, rc::Rc, sync::{Mutex, Arc}, thread::ThreadId, cell::RefCell};
 use codec::{Decode, Encode};
 use sp_core::sandbox as sandbox_primitives;
 
@@ -94,6 +94,12 @@ struct Imports {
 
 	/// Maps qualified field name to its memory reference
 	memories_map: HashMap<(Vec<u8>, Vec<u8>), MemoryRef>,
+}
+
+impl Imports {
+	fn func_by_name(&self, module_name: &str, func_name: &str) -> Option<GuestFuncIndex> {
+		self.func_map.get(&(module_name.as_bytes().to_owned(), func_name.as_bytes().to_owned())).cloned()
+	}
 }
 
 impl ImportResolver for Imports {
@@ -203,11 +209,13 @@ pub struct GuestExternals<'a, FE: SandboxCapabilities + 'a> {
 	supervisor_externals: &'a mut FE,
 
 	/// Instance of sandboxed module to be dispatched
-	sandbox_instance: &'a SandboxInstance<FE::SupervisorFuncRef>,
+	sandbox_instance: &'a SandboxInstance<FE::SupervisorFuncRef, FE>,
 
 	/// Opaque pointer to outer context, see the `instantiate` function
 	state: u32,
 }
+
+
 
 /// Construct trap error from specified message
 fn trap(msg: &'static str) -> Trap {
@@ -317,7 +325,7 @@ impl<'a, FE: SandboxCapabilities + 'a> Externals for GuestExternals<'a, FE> {
 
 fn with_guest_externals<FE, R, F>(
 	supervisor_externals: &mut FE,
-	sandbox_instance: &SandboxInstance<FE::SupervisorFuncRef>,
+	sandbox_instance: &SandboxInstance<FE::SupervisorFuncRef, FE>,
 	state: u32,
 	f: F,
 ) -> R
@@ -347,14 +355,49 @@ where
 /// This is generic over a supervisor function reference type.
 ///
 /// [`invoke`]: #method.invoke
-pub struct SandboxInstance<FR> {
+pub struct SandboxInstance<FR, FE> {
 	wasmi_instance: ModuleRef,
 	wasmtime_instance: wasmtime::Instance,
 	dispatch_thunk: FR,
 	guest_to_supervisor_mapping: GuestToSupervisorFunctionMapping,
+	state_holder: Arc<Mutex<ScopedStateHolder<FE>>>,
 }
 
-impl<FR> SandboxInstance<FR> {
+struct ScopedStateHolder<FE> {
+	supervisor_externals: Option<(*mut FE, ThreadId)>,
+}
+
+impl<FR, FE: SandboxCapabilities<SupervisorFuncRef=FR>> ScopedStateHolder<FE> {
+	fn new(externals: Option<&mut FE>) -> ScopedStateHolder<FE> {
+		let thread_id = std::thread::current().id();
+
+		ScopedStateHolder { 
+			supervisor_externals: externals.map(|e| (e as *mut FE, thread_id)),
+		}
+	}
+
+	fn set(&mut self, supervisor_externals: &mut FE) {
+		assert!(self.supervisor_externals.is_none());
+
+		let thread_id = std::thread::current().id();
+		self.supervisor_externals = Some((supervisor_externals as *mut FE, thread_id));
+	}
+
+	fn reset(&mut self) {
+		assert!(self.supervisor_externals.is_some());
+		self.supervisor_externals.take();
+	}
+
+	fn get_externals(&mut self) -> &mut FE {
+		let &(externals, thread_id) = self.supervisor_externals.as_ref().unwrap();
+		assert_eq!(thread_id, std::thread::current().id(), "attempt to invoke holder from a different thread");
+
+		// Safe as long as reference is scoped and tied to the same thread
+		unsafe { &mut *externals }
+	}
+}
+
+impl<FR, FE: SandboxCapabilities<SupervisorFuncRef=FR>> SandboxInstance<FR, FE> {
 	/// Invoke an exported function by a name.
 	///
 	/// `supervisor_externals` is required to execute the implementations
@@ -362,7 +405,7 @@ impl<FR> SandboxInstance<FR> {
 	///
 	/// The `state` parameter can be used to provide custom data for
 	/// these syscall implementations.
-	pub fn invoke<FE: SandboxCapabilities<SupervisorFuncRef=FR>>(
+	pub fn invoke(
 		&self,
 
 		// function to call that is exported from the module
@@ -377,7 +420,10 @@ impl<FR> SandboxInstance<FR> {
 		// arbitraty context data of the call
 		state: u32,
 	) -> std::result::Result<Option<wasmi::RuntimeValue>, wasmi::Error> {
-		with_guest_externals(
+		let mut state_holder = self.state_holder.lock().unwrap();
+		state_holder.set(supervisor_externals);
+
+		let result = with_guest_externals(
 			supervisor_externals,
 			self,
 			state,
@@ -401,6 +447,7 @@ impl<FR> SandboxInstance<FR> {
 					})
 					.collect();
 
+
 				let wasmtime_result = wasmtime_function
 					.call(&args)
 					.map_err(|e| wasmi::Error::Function(e.to_string()))?;
@@ -420,7 +467,11 @@ impl<FR> SandboxInstance<FR> {
 
 				Ok(wasmi_result)
 			},
-		)
+		);
+
+		state_holder.reset();
+
+		result
 	}
 
 	/// Get the value from a global with the given `name`.
@@ -433,7 +484,10 @@ impl<FR> SandboxInstance<FR> {
 			.get();
 		let wasmi_value = wasmi_global.into();
 
-		let wasmtime_global = self.wasmtime_instance.get_global(name)?.get();
+		let wasmtime_global = self.wasmtime_instance.get_global(name)?
+		// .expect(&format!("failed to get global {}", name))
+		.get();
+
 		let wasmtime_value = match wasmtime_global {
 			Val::I32(val) => Value::I32(val),
 			Val::I64(val) => Value::I64(val),
@@ -517,8 +571,8 @@ impl GuestEnvironment {
 	/// Decodes an environment definition from the given raw bytes.
 	///
 	/// Returns `Err` if the definition cannot be decoded.
-	pub fn decode<FR>(
-		store: &Store<FR>,
+	pub fn decode<FR, FE>(
+		store: &Store<FR, FE>,
 		raw_env_def: &[u8],
 	) -> std::result::Result<Self, InstantiationError> {
 		let (imports, guest_to_supervisor_mapping) =
@@ -534,13 +588,13 @@ impl GuestEnvironment {
 ///
 /// To finish off the instantiation the user must call `register`.
 #[must_use]
-pub struct UnregisteredInstance<FR> {
-	sandbox_instance: Rc<SandboxInstance<FR>>,
+pub struct UnregisteredInstance<FR, FE> {
+	sandbox_instance: Rc<SandboxInstance<FR, FE>>,
 }
 
-impl<FR> UnregisteredInstance<FR> {
+impl<FR, FE> UnregisteredInstance<FR, FE> {
 	/// Finalizes instantiation of this module.
-	pub fn register(self, store: &mut Store<FR>) -> u32 {
+	pub fn register(self, store: &mut Store<FR, FE>) -> u32 {
 		// At last, register the instance.
 		let instance_idx = store.register_sandbox_instance(self.sandbox_instance);
 		instance_idx
@@ -561,30 +615,83 @@ pub fn instantiate<'a, FE: SandboxCapabilities>(
 	wasm: &[u8],
 	guest_env: GuestEnvironment,
 	state: u32,
-) -> std::result::Result<UnregisteredInstance<FE::SupervisorFuncRef>, InstantiationError> {
+) -> std::result::Result<UnregisteredInstance<FE::SupervisorFuncRef, FE>, InstantiationError> {
 	let wasmi_module = Module::from_buffer(wasm).map_err(|_| InstantiationError::ModuleDecoding)?;
 	let wasmi_instance = ModuleInstance::new(&wasmi_module, &guest_env.imports)
 		.map_err(|_| InstantiationError::Instantiation)?;
 
 	let mut config = wasmtime::Config::new();
 	config.cranelift_opt_level(wasmtime::OptLevel::Speed);
-	config.strategy(wasmtime::Strategy::Lightbeam).map_err(|_| InstantiationError::ModuleDecoding)?;
+	// config.strategy(wasmtime::Strategy::Lightbeam).map_err(|_| InstantiationError::ModuleDecoding)?;
 
 	let wasmtime_engine = wasmtime::Engine::new(&config);
 	let wasmtime_store = wasmtime::Store::new(&wasmtime_engine);
 
 	let wasmtime_module = wasmtime::Module::new(&wasmtime_store, wasm).map_err(|_| InstantiationError::ModuleDecoding)?;
 
+	let state_holder = Arc::new(Mutex::new(ScopedStateHolder::new(None)));
+
 	let module_imports: Vec<_> = wasmtime_module
 		.imports()
 		.filter_map(|import| {
 			if let wasmtime::ExternType::Func(func_ty) = import.ty() {
+				let guest_func_index = guest_env.imports
+					.func_by_name(import.module(), import.name()).expect("missing import");
+
+				let supervisor_func_index = guest_env.guest_to_supervisor_mapping
+					.func_by_guest_index(guest_func_index).expect("missing guest to host mapping");
+
+				let state_holder = state_holder.clone();
 				Some(wasmtime::Extern::Func(wasmtime::Func::new(&wasmtime_store, func_ty,
-					move |_, _, _| Err(wasmtime::Trap::new(format!(
-						"Sandbox function stub",
-						// func_ty.to_string(),
-						// func_ty.name().to_string()
-					)))
+					move |caller, params, result| {
+						let state_holder = state_holder.lock().unwrap();
+						let supervisor_externals = state_holder.get_externals();
+
+						// Serialize arguments into a byte vector.
+						/*let invoke_args_data = params
+							.iter()
+							.map(|&val| match val {
+								Val::I32(val) => Value::I32(val),
+								Val::I64(val) => Value::I64(val),
+								Val::F32(val) => Value::F32(val),
+								Val::F64(val) => Value::F64(val),
+								_ => unimplemented!()
+							})
+							.collect::<Vec<_>>()
+							.encode();
+
+						// Move serialized arguments inside the memory, invoke dispatch thunk and
+						// then free allocated memory.
+						let invoke_args_len = invoke_args_data.len() as WordSize;
+						let invoke_args_ptr = supervisor_externals
+							.allocate_memory(invoke_args_len)
+							.map_err(|_| wasmtime::Trap::new("Can't allocate memory in supervisor for the arguments"))?;
+
+						let deallocate = |ptr, fail_msg| {
+							supervisor_externals
+								.deallocate_memory(ptr)
+								.map_err(|_| wasmtime::Trap::new(fail_msg))
+						};
+
+						if supervisor_externals
+							.write_memory(invoke_args_ptr, &invoke_args_data)
+							.is_err()
+						{
+							deallocate(invoke_args_ptr, "Failed dealloction after failed write of invoke arguments")?;
+							return Err(wasmtime::Trap::new("Can't write invoke args into memory"));
+						}
+
+						let result = supervisor_externals.invoke(
+							&dispatch_thunk,
+							invoke_args_ptr,
+							invoke_args_len,
+							state,
+							supervisor_func_index,
+						);*/
+
+						// todo deallocate and parse result
+						Ok(())
+					}
 				)))
 			} else {
 				None
@@ -602,6 +709,7 @@ pub fn instantiate<'a, FE: SandboxCapabilities>(
 		wasmtime_instance,
 		dispatch_thunk,
 		guest_to_supervisor_mapping: guest_env.guest_to_supervisor_mapping,
+		state_holder,
 	});
 
 	with_guest_externals(
@@ -623,13 +731,13 @@ pub fn instantiate<'a, FE: SandboxCapabilities>(
 /// This struct keeps track of all sandboxed components.
 ///
 /// This is generic over a supervisor function reference type.
-pub struct Store<FR> {
+pub struct Store<FR, FE> {
 	// Memories and instances are `Some` until torn down.
-	instances: Vec<Option<Rc<SandboxInstance<FR>>>>,
+	instances: Vec<Option<Rc<SandboxInstance<FR, FE>>>>,
 	memories: Vec<Option<MemoryRef>>,
 }
 
-impl<FR> Store<FR> {
+impl<FR, FE> Store<FR, FE> {
 	/// Create a new empty sandbox store.
 	pub fn new() -> Self {
 		Store {
@@ -667,7 +775,7 @@ impl<FR> Store<FR> {
 	///
 	/// Returns `Err` If `instance_idx` isn't a valid index of an instance or
 	/// instance is already torndown.
-	pub fn instance(&self, instance_idx: u32) -> Result<Rc<SandboxInstance<FR>>> {
+	pub fn instance(&self, instance_idx: u32) -> Result<Rc<SandboxInstance<FR, FE>>> {
 		self.instances
 			.get(instance_idx as usize)
 			.cloned()
@@ -723,7 +831,7 @@ impl<FR> Store<FR> {
 		}
 	}
 
-	fn register_sandbox_instance(&mut self, sandbox_instance: Rc<SandboxInstance<FR>>) -> u32 {
+	fn register_sandbox_instance(&mut self, sandbox_instance: Rc<SandboxInstance<FR, FE>>) -> u32 {
 		let instance_idx = self.instances.len();
 		self.instances.push(Some(sandbox_instance));
 		instance_idx as u32

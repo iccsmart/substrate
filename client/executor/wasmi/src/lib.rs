@@ -37,7 +37,7 @@ use sc_executor_common::{
 use sc_executor_common::util::{DataSegmentsSnapshot, WasmModuleInfo};
 
 struct FunctionExecutor<'a> {
-	sandbox_store: sandbox::Store<wasmi::FuncRef>,
+	sandbox_store: sandbox::Store<wasmi::FuncRef, Self>,
 	heap: sp_allocator::FreeingBumpHeapAllocator,
 	memory: MemoryRef,
 	table: Option<TableRef>,
